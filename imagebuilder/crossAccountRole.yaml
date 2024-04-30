@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create cross account role for EC2 ImageBuilder to copy AMI. By default, allows ccs-oam-prod (085714201707) to assume role. 
+Parameters:
+  AccountId:
+    Type: String
+    Default: '085714201707' #ccs-oam-prod
+    Description: AWS Account ID in which EC2 Image Builder is running. 
+Resources:
+  EC2ImageBuilderDistributionCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2ImageBuilderDistributionCrossAccountRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AccountId}:root
+        Version: 2012-10-17
+      Path: /
+  EC2ImageBuilderDistributionCrossAccountRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: EC2ImageBuilderDistributionCrossAccountPolicy
+      Roles:
+        - !Ref EC2ImageBuilderDistributionCrossAccountRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - ec2:DescribeImages
+              - ec2:CopyImage
+              - ec2:ModifyImageAttribute
+              - ec2:CreateTags
+              - kms:CreateGrant
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKeyWithoutPlainText
+              - kms:ReEncrypt
+            Effect: Allow
+            Resource: '*'

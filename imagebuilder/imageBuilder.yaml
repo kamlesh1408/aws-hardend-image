@@ -1,0 +1,478 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create CCS EKS golden image using EC2 ImageBuilder.
+Parameters:
+  AMI:
+    Description: Parent image id
+    Type: String
+  ImageName:
+    Description: Parent image name
+    Type: String
+  Version:
+    Description: Pipeline document version
+    Type: String
+Resources:
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms     
+  ImageBuilderScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms 
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonInspectorFullAccess
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: 2012-10-17
+      Path: /executionServiceEC2Role/
+  InstanceRoleS3Policy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to save log files and get scripts to/from s3.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                - BUCKET: !Ref ImageBuilderLogBucket
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                - BUCKET: !Ref ImageBuilderScriptsBucket
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}
+                - BUCKET: !Ref ImageBuilderScriptsBucket
+  InspectorPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows  Inspector component to run.
+    Properties:
+      PolicyName: ImageBuilderInspectorPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - ssm:SendCommand
+              - ec2:CreateTags
+            Effect: Allow
+            Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: 
+        - !Ref InstanceRole
+  ImageInfraConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: ccs-eks-golden
+      InstanceProfileName:
+        Ref: InstanceProfile
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+      TerminateInstanceOnFailure: true
+  CIS:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: CIS-benchmarks
+      Version: !Ref Version
+      Description: Run CIS Benchmarks script
+      Platform: Linux
+      Data: !Sub 
+            - | 
+              name: CIS-Benchmarks-Script
+              description: Get CIS Benchmarks script and run
+              schemaVersion: 1.0
+              phases:
+                - name: build
+                  steps:
+                    - name: DownloadScripts
+                      action: S3Download
+                      inputs:
+                        - source: 's3://${BUCKET}/*'
+                          destination: '/tmp'
+                    - name: Chmod
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - 'chmod +x {{ build.DownloadScripts.inputs[0].destination }}/pk_CIS_awslinux2_Benchmark_v1.0.0.sh'
+                    - name: Run
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - '{{ build.DownloadScripts.inputs[0].destination }}/pk_CIS_awslinux2_Benchmark_v1.0.0.sh'
+                    - name: InstallAnsible
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - 'amazon-linux-extras install -y ansible2'
+                    - name: InvokeAnsible
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - 'ansible-playbook -c local -i localhost, {{ build.DownloadScripts.inputs[0].destination }}/mc_CIS_awslinux2_Benchmark-L1.yaml'
+            - BUCKET: !Ref ImageBuilderScriptsBucket
+  McafeeAgent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: MA-install
+      Version: !Ref Version
+      Description: Run Trellix Agent Smart Install script
+      Platform: Linux
+      Data: !Sub 
+            - | 
+              name: MA-Install-Script
+              description: Get Trellix Agent Smart Install script and run
+              schemaVersion: 1.0
+              phases:
+                - name: build
+                  steps:
+                    - name: DownloadScripts
+                      action: S3Download
+                      inputs:
+                        - source: 's3://${BUCKET}/TrellixSmartInstall.sh'
+                          destination: '/tmp/TrellixSmartInstall.sh'
+                    - name: Chmod
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - 'chmod +x {{ build.DownloadScripts.inputs[0].destination }}'
+                    - name: Run
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - '{{ build.DownloadScripts.inputs[0].destination }}'
+                    - name: ResetGUID
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - '/opt/McAfee/agent/bin/maconfig -enforce -noguid'                          
+            - BUCKET: !Ref ImageBuilderScriptsBucket            
+  FIPS:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: FIPS-enable
+      Version: !Ref Version
+      Description: Run FIPS enable script
+      Platform: Linux
+      Data: !Sub 
+            - | 
+              name: FIPS-Enable-Script
+              description: Get FIPS script and run
+              schemaVersion: 1.0
+              phases:
+                - name: build
+                  steps:
+                    - name: DownloadScripts
+                      action: S3Download
+                      inputs:
+                        - source: 's3://${BUCKET}/pk_awslinux2_enable_fips.sh'
+                          destination: '/tmp/pk_awslinux2_enable_fips.sh'
+                    - name: Chmod
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - 'chmod +x {{ build.DownloadScripts.inputs[0].destination }}'
+                    - name: Run
+                      action: ExecuteBash
+                      onFailure: Abort
+                      inputs:
+                        commands:
+                          - '{{ build.DownloadScripts.inputs[0].destination }}'
+            - BUCKET: !Ref ImageBuilderScriptsBucket            
+  SSM:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: SSM-agent
+      Version: !Ref Version
+      Description: Run SSM Agent install
+      Platform: Linux
+      Data: |
+        name: SSM-AgentInstall
+        description: Download and run a SSM Agent install
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: RemoveSSMInstalled
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - 'rm -f /tmp/imagebuilder_service/ssm_installed'
+              - name: Enable
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - 'systemctl is-enabled amazon-ssm-agent | grep enabled || systemctl enable amazon-ssm-agent && echo "Amazon SSM Agent has been enabled"'
+  UpdateOS:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: Updateos
+      Version: !Ref Version
+      Description: Update OS
+      Platform: Linux
+      Data: |
+        name: UpdateOS
+        description: Update OS
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: UpdateMyLinux
+                action: UpdateOS
+                onFailure: Abort
+                maxAttempts: 3
+  CCSEKSGoldenImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: ccs-eks-golden
+      Version: !Ref Version
+      ParentImage: !Ref AMI
+      Components:
+        - ComponentArn: !Ref UpdateOS
+        - ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/reboot-linux/1.0.1/1
+        - ComponentArn: !Ref SSM
+        - ComponentArn: !Ref CIS
+        - ComponentArn: !Ref McafeeAgent
+        - ComponentArn: !Ref FIPS
+        #- ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/inspector-test-linux/1.0.1/1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda  
+          Ebs:
+            DeleteOnTermination: true
+            # Encrypted: true
+            # KmsKeyId: !GetAtt KMSKey.Arn
+  CCSEKSGoldenImageRecipeCanada:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: ccs-eks-golden-govca
+      Version: !Ref Version
+      ParentImage: !Ref AMI
+      Components:
+        - ComponentArn: !Ref UpdateOS
+        - ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/reboot-linux/1.0.1/1
+        - ComponentArn: !Ref SSM
+        - ComponentArn: !Ref CIS
+        - ComponentArn: !Ref FIPS
+        #- ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/inspector-test-linux/1.0.1/1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda  
+          Ebs:
+            DeleteOnTermination: true
+            # Encrypted: true
+            # KmsKeyId: !GetAtt KMSKey.Arn            
+  ImageDistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: ccs-eks-golden-image
+      Description: ccs eks node golden image
+      Distributions:
+        - Region: !Ref AWS::Region # local region
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '880416499896' # corp-mvisionedr-preprod
+              - '983703175993' # ccs-copperfield-p
+              - '197370208931' # Fernetdevenv
+              - '906951592850' # corporate-investigator-preprod
+              - '518861015603' # corporate-investigator-int
+        - Region: us-east-1
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '983703175993' # ccs-copperfield-p
+        - Region: eu-central-1
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '983703175993' # ccs-copperfield-p
+        - Region: ap-southeast-2
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '983703175993' # ccs-copperfield-p
+        - Region: ap-south-1
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '983703175993' # ccs-copperfield-p
+        - Region: ca-central-1
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image
+            TargetAccountIds:
+              - '983703175993' # ccs-copperfield-p
+      Tags:
+        Pipeline: ccs-eks-golden-pipeline 
+  ImageDistributionConfigurationCanada:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: ccs-eks-golden-govca
+      Description: ccs eks node golden image for govca
+      Distributions:
+        - Region: ca-central-1
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - ccs-golden-govca
+              - !Ref ImageName
+              - "{{ imagebuilder:buildDate }}"
+            Description: ccs eks node golden image for govca
+            TargetAccountIds:
+              - '203726635168' # corp-govca-prod
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: ccs-eks-golden-pipeline
+      Description: ccs eks golden image
+      ImageRecipeArn: !Ref CCSEKSGoldenImageRecipe
+      InfrastructureConfigurationArn: !Ref ImageInfraConfiguration
+      DistributionConfigurationArn: !Ref ImageDistributionConfiguration
+      Status: ENABLED
+  ImagePipelineCanada:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: ccs-eks-golden-pipeline-govca
+      Description: ccs eks golden image for govca
+      ImageRecipeArn: !Ref CCSEKSGoldenImageRecipeCanada
+      InfrastructureConfigurationArn: !Ref ImageInfraConfiguration
+      DistributionConfigurationArn: !Ref ImageDistributionConfigurationCanada
+      Status: ENABLED      
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key for encrypting snapshots and images.
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: golden-image-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root # local aws account
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AAD_Admin # local aws account
+          Action:
+            - kms:Create*
+            - kms:Describe*
+            - kms:Enable*
+            - kms:List*
+            - kms:Put*
+            - kms:Update*
+            - kms:Revoke*
+            - kms:Disable*
+            - kms:Get*
+            - kms:Delete*
+            - kms:ScheduleKeyDeletion
+            - kms:CancelKeyDeletion
+          Resource: "*"
+        - Sid: Allow use of the key
+          Effect: Allow
+          Principal:
+            AWS: 
+              - !Sub arn:${AWS::Partition}:iam::085714201707:role/EC2ImageBuilderDistributionCrossAccountRole # ccs-oam-prod
+              - !Sub arn:${AWS::Partition}:iam::880416499896:role/EC2ImageBuilderDistributionCrossAccountRole # corp-mvisionedr-preprod
+              - !Sub arn:${AWS::Partition}:iam::983703175993:role/EC2ImageBuilderDistributionCrossAccountRole # ccs-copperfield-p
+              - !Sub arn:${AWS::Partition}:iam::197370208931:role/EC2ImageBuilderDistributionCrossAccountRole # Fernetdevenv
+              - !Sub arn:${AWS::Partition}:iam::906951592850:role/EC2ImageBuilderDistributionCrossAccountRole # corporate-investigator-preprod
+              - !Sub arn:${AWS::Partition}:iam::518861015603:role/EC2ImageBuilderDistributionCrossAccountRole # corporate-investigator-int
+              - !Sub arn:${AWS::Partition}:iam::203726635168:role/EC2ImageBuilderDistributionCrossAccountRole # corp-govca-prod
+          Action:
+            - kms:DescribeKey
+            - kms:Decrypt
+            - kms:ReEncrypt*
+            - kms:CreateGrant
+            - kms:GenerateDataKeyWithoutPlainText
+          Resource: "*"
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ccs-golden-image
+      TargetKeyId: !Ref KMSKey
+Outputs:
+  ScriptsBucket:
+    Description: Upload CIS Benchmark and other scripts to this S3 bucket.
+    Value: !Ref ImageBuilderScriptsBucket
+    Export:
+      Name: ScriptsBucket

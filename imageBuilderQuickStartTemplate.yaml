@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 Image Builder pipeline template.
+Parameters:
+  AMI:
+    Description: Parent image id. Must be in the same region. Default is Amazon Linux 2 AMI (HVM) US-WEST-2 Oregon.
+    Type: String
+    AllowedPattern: "(ami-[a-zA-Z0-9]*)"
+    Default: "ami-0528a5175983e7f28" # Amazon Linux 2 AMI (HVM) US-WEST-2 Oregon
+Resources:
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms     
+  ImageBuilderScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms 
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: 2012-10-17
+      Path: /executionServiceEC2Role/
+  InstanceRoleS3Policy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to save log files and get scripts to/from s3.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                - BUCKET: !Ref ImageBuilderLogBucket
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                - BUCKET: !Ref ImageBuilderScriptsBucket
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:s3:::${BUCKET}
+                - BUCKET: !Ref ImageBuilderScriptsBucket                
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: 
+        - !Ref InstanceRole
+  ImageInfraConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: imagebuilder-template
+      InstanceProfileName:
+        Ref: InstanceProfile
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+      TerminateInstanceOnFailure: true
+  UpdateOSComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: UpdateOS
+      Version: 1.0.0
+      Description: Update OS
+      ChangeDescription: First version
+      Platform: Linux
+      Data: |
+        name: UpdateOS
+        description: Update OS
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: UpdateMyLinux
+                action: UpdateOS
+                onFailure: Abort
+                maxAttempts: 3
+  HelloWorldComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: HelloWorld
+      Version: 1.0.0
+      Description: Sample hello world
+      ChangeDescription: First version
+      Platform: Linux
+      Data: |
+        name: Hello World
+        description: This is hello world testing document for Linux.
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: HelloWorldStep
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo 'Hello World from the build phase.'
+          - name: validate
+            steps:
+              - name: HelloWorldStep
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo 'Hello World from the validate phase.'
+          - name: test
+            steps:
+              - name: HelloWorldStep
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo 'Hello World from the test phase.'
+  GoldenImageRecipeTemplate:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: imagebuilder-template
+      Version: 1.0.0
+      ParentImage: !Ref AMI
+      Components:      
+        - ComponentArn: !Ref UpdateOSComponent
+        - ComponentArn: !Ref HelloWorldComponent
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda  
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !Ref KMSKey
+  ImageDistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: imagebuilder-template
+      Description: imagebuilder template image
+      Distributions:
+        - Region: !Ref AWS::Region # local region
+          AmiDistributionConfiguration:
+            Name: !Join
+            - "-"
+            - - imagebuilder-template
+              - "{{ imagebuilder:buildDate }}"
+            Description: imagebuilder template image 
+            #targetAccountIds: # accounts to copy image to. requires additional cross account role.
+              # - '380164030174' # ccs-ops-sandbox
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: imagebuilder-pipeline-template
+      Description: imagebuilder pipeline template
+      ImageRecipeArn: !Ref GoldenImageRecipeTemplate
+      InfrastructureConfigurationArn: !Ref ImageInfraConfiguration
+      DistributionConfigurationArn: !Ref ImageDistributionConfiguration
+      Status: ENABLED
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key for encrypting snapshots and images.
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: golden-image-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root # local aws account
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AAD_Admin # local aws account
+          Action:
+            - kms:Create*
+            - kms:Describe*
+            - kms:Enable*
+            - kms:List*
+            - kms:Put*
+            - kms:Update*
+            - kms:Revoke*
+            - kms:Disable*
+            - kms:Get*
+            - kms:Delete*
+            - kms:ScheduleKeyDeletion
+            - kms:CancelKeyDeletion
+          Resource: "*"
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/imagebuilder-template
+      TargetKeyId: !Ref KMSKey
+Outputs:
+  ScriptsBucket:
+    Description: Upload CIS Benchmark and other scripts to this S3 bucket.
+    Value: !Ref ImageBuilderScriptsBucket
+    Export:
+      Name: ScriptsBucket
